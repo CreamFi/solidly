@@ -3,9 +3,9 @@ pragma solidity 0.8.11;
 
 contract BaseV1 {
 
-    string public constant symbol = "BaseV1";
-    string public constant name = "BaseV1";
-    uint256 public decimals = 18;
+    string public constant symbol = "SOLID";
+    string public constant name = "Solidly";
+    uint8 public constant decimals = 18;
     uint256 public totalSupply = 0;
 
     mapping(address => uint256) public balanceOf;
@@ -29,24 +29,13 @@ contract BaseV1 {
         address _router
     ) {
         router = _router;
-        uint chainId;
-        assembly {
-            chainId := chainid()
-        }
-        DOMAIN_SEPARATOR = keccak256(
-            abi.encode(
-                keccak256('EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)'),
-                keccak256(bytes(name)),
-                keccak256(bytes('1')),
-                chainId,
-                address(this)
-            )
-        );
+        minter = msg.sender;
         _mint(msg.sender, 0);
     }
 
+    // No checks as its meant to be once off to set minting rights to BaseV1 Minter
     function setMinter(address _minter) external {
-        require(msg.sender == router);
+        require(msg.sender == minter);
         minter = _minter;
     }
 
@@ -58,6 +47,15 @@ contract BaseV1 {
 
     function permit(address owner, address spender, uint value, uint deadline, uint8 v, bytes32 r, bytes32 s) external {
         require(deadline >= block.timestamp, 'StableV1: EXPIRED');
+        DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                keccak256('EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)'),
+                keccak256(bytes(name)),
+                keccak256(bytes('1')),
+                block.chainid,
+                address(this)
+            )
+        );
         bytes32 digest = keccak256(
             abi.encodePacked(
                 '\x19\x01',
@@ -73,8 +71,8 @@ contract BaseV1 {
     }
 
     function _mint(address _to, uint _amount) internal returns (bool) {
-        balanceOf[_to] = _amount;
-        totalSupply = _amount;
+        balanceOf[_to] += _amount;
+        totalSupply += _amount;
         emit Transfer(address(0x0), _to, _amount);
         return true;
     }

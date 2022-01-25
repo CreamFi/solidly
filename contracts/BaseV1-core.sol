@@ -13,9 +13,6 @@ interface erc20 {
 }
 
 library Math {
-    function max(uint a, uint b) internal pure returns (uint) {
-        return a >= b ? a : b;
-    }
     function min(uint a, uint b) internal pure returns (uint) {
         return a < b ? a : b;
     }
@@ -31,101 +28,19 @@ library Math {
             z = 1;
         }
     }
-    function cbrt(uint256 n) internal pure returns (uint256) { unchecked {
-        uint256 x = 0;
-        for (uint256 y = 1 << 255; y > 0; y >>= 3) {
-            x <<= 1;
-            uint256 z = 3 * x * (x + 1) + 1;
-            if (n / y >= z) {
-                n -= y * z;
-                x += 1;
-            }
-        }
-        return x;
-    }}
 }
 
 interface IBaseV1Callee {
     function hook(address sender, uint amount0, uint amount1, bytes calldata data) external;
 }
 
-library UQ112x112 {
-    uint224 constant Q112 = 2**112;
-
-    // encode a uint112 as a UQ112x112
-    function encode(uint112 y) internal pure returns (uint224 z) {
-        z = uint224(y) * Q112; // never overflows
-    }
-
-    // divide a UQ112x112 by a uint112, returning a UQ112x112
-    function uqdiv(uint224 x, uint112 y) internal pure returns (uint224 z) {
-        z = x / uint224(y);
-    }
-}
-
-// a library for handling binary fixed point numbers (https://en.wikipedia.org/wiki/Q_(number_format))
-library FixedPoint {
-    // range: [0, 2**112 - 1]
-    // resolution: 1 / 2**112
-    struct uq112x112 {
-        uint224 _x;
-    }
-
-    // range: [0, 2**144 - 1]
-    // resolution: 1 / 2**112
-    struct uq144x112 {
-        uint _x;
-    }
-
-    uint8 private constant RESOLUTION = 112;
-
-    // encode a uint112 as a UQ112x112
-    function encode(uint112 x) internal pure returns (uq112x112 memory) {
-        return uq112x112(uint224(x) << RESOLUTION);
-    }
-
-    // encodes a uint144 as a UQ144x112
-    function encode144(uint144 x) internal pure returns (uq144x112 memory) {
-        return uq144x112(uint256(x) << RESOLUTION);
-    }
-
-    // divide a UQ112x112 by a uint112, returning a UQ112x112
-    function div(uq112x112 memory self, uint112 x) internal pure returns (uq112x112 memory) {
-        require(x != 0, 'FixedPoint: DIV_BY_ZERO');
-        return uq112x112(self._x / uint224(x));
-    }
-
-    // multiply a UQ112x112 by a uint, returning a UQ144x112
-    // reverts on overflow
-    function mul(uq112x112 memory self, uint y) internal pure returns (uq144x112 memory) {
-        uint z;
-        require(y == 0 || (z = uint(self._x) * y) / y == uint(self._x), "FixedPoint: MULTIPLICATION_OVERFLOW");
-        return uq144x112(z);
-    }
-
-    // returns a UQ112x112 which represents the ratio of the numerator to the denominator
-    // equivalent to encode(numerator).div(denominator)
-    function fraction(uint112 numerator, uint112 denominator) internal pure returns (uq112x112 memory) {
-        require(denominator > 0, "FixedPoint: DIV_BY_ZERO");
-        return uq112x112((uint224(numerator) << RESOLUTION) / denominator);
-    }
-
-    // decode a UQ112x112 into a uint112 by truncating after the radix point
-    function decode(uq112x112 memory self) internal pure returns (uint112) {
-        return uint112(self._x >> RESOLUTION);
-    }
-
-    // decode a UQ144x112 into a uint144 by truncating after the radix point
-    function decode144(uq144x112 memory self) internal pure returns (uint144) {
-        return uint144(self._x >> RESOLUTION);
-    }
-}
-
 // Base V1 Fees contract is used as a 1:1 pair relationship to split out fees, this ensures that the curve does not need to be modified for LP shares
 contract BaseV1Fees {
+
     address immutable pair; // The pair it is bonded to
     address immutable token0; // token0 of pair, saved localy and statically for gas optimization
     address immutable token1; // Token1 of pair, saved localy and statically for gas optimization
+
     constructor(address _token0, address _token1) {
         pair = msg.sender;
         token0 = _token0;
@@ -149,8 +64,6 @@ contract BaseV1Fees {
 
 // The base pair of pools, either stable or volatile
 contract BaseV1Pair {
-    using FixedPoint for *;
-    using UQ112x112 for uint224;
 
     string public name;
     string public symbol;
@@ -164,9 +77,9 @@ contract BaseV1Pair {
     mapping(address => mapping (address => uint)) public allowance;
     mapping(address => uint) public balanceOf;
 
-    bytes32 public DOMAIN_SEPARATOR;
+    bytes32 DOMAIN_SEPARATOR;
     // keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
-    bytes32 public constant PERMIT_TYPEHASH = 0x6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c9;
+    bytes32 constant PERMIT_TYPEHASH = 0x6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c9;
     mapping(address => uint) public nonces;
 
     uint internal constant MINIMUM_LIQUIDITY = 10**3;
@@ -180,36 +93,25 @@ contract BaseV1Pair {
 
     // Structure to capture time period obervations every 30 minutes, used for local oracles
     struct Observation {
-        uint32 timestamp;
-        uint price0Cumulative;
-        uint price1Cumulative;
+        uint timestamp;
+        uint reserve0Cumulative;
+        uint reserve1Cumulative;
     }
 
     // Capture oracle reading every 30 minutes
-    uint public constant periodSize = 1800;
-
-    function observationLength() external view returns (uint) {
-        return observations.length;
-    }
-
-    function lastObservation() public view returns (Observation memory) {
-        return observations[observations.length-1];
-    }
+    uint constant periodSize = 1800;
 
     Observation[] public observations;
 
     uint immutable decimals0;
     uint immutable decimals1;
 
-    uint112 public reserve0;
-    uint112 public reserve1;
-    uint32 public blockTimestampLast;
+    uint public reserve0;
+    uint public reserve1;
+    uint public blockTimestampLast;
 
-    // reserve0Last and reserve1Last is added to allow for liquidity checks to ensure no liquidity manipulation via flash loan
-    uint public reserve0Last;
-    uint public reserve1Last;
-    uint public price0CumulativeLast;
-    uint public price1CumulativeLast;
+    uint public reserve0CumulativeLast;
+    uint public reserve1CumulativeLast;
 
     // index0 and index1 are used to accumulate fees, this is split out from normal trades to keep the swap "clean"
     // this further allows LP holders to easily claim fees for tokens they have/staked
@@ -220,29 +122,61 @@ contract BaseV1Pair {
     mapping(address => uint) public supplyIndex0;
     mapping(address => uint) public supplyIndex1;
 
-    // Accrue fees on token0
-    function _update0(uint amount) internal {
-        _safeTransfer(token0, fees, amount); // transfer the fees out to BaseV1Fees
-        uint256 _ratio = amount * 1e18 / totalSupply; // 1e18 adjustment is removed during claim
-        if (_ratio > 0) {
-          index0 += _ratio;
-        }
-        emit Fees(msg.sender, amount, 0);
-    }
-
-    // Accrue fees on token1
-    function _update1(uint amount) internal {
-        _safeTransfer(token1, fees, amount);
-        uint256 _ratio = amount * 1e18 / totalSupply;
-        if (_ratio > 0) {
-          index1 += _ratio;
-        }
-        emit Fees(msg.sender, 0, amount);
-    }
-
     // tracks the amount of unclaimed, but claimable tokens off of fees for token0 and token1
     mapping(address => uint) public claimable0;
     mapping(address => uint) public claimable1;
+
+    event Fees(address indexed sender, uint amount0, uint amount1);
+    event Mint(address indexed sender, uint amount0, uint amount1);
+    event Burn(address indexed sender, uint amount0, uint amount1, address indexed to);
+    event Swap(
+        address indexed sender,
+        uint amount0In,
+        uint amount1In,
+        uint amount0Out,
+        uint amount1Out,
+        address indexed to
+    );
+    event Sync(uint reserve0, uint reserve1);
+
+    constructor() {
+        (address _token0, address _token1, bool _stable) = BaseV1Factory(msg.sender).getInitializable();
+        (token0, token1, stable) = (_token0, _token1, _stable);
+        fees = address(new BaseV1Fees(_token0, _token1));
+        if (_stable) {
+            name = string(abi.encodePacked("StableV1 AMM - ", erc20(_token0).symbol(), "/", erc20(_token1).symbol()));
+            symbol = string(abi.encodePacked("sAMM-", erc20(_token0).symbol(), "/", erc20(_token1).symbol()));
+        } else {
+            name = string(abi.encodePacked("VolatileV1 AMM - ", erc20(_token0).symbol(), "/", erc20(_token1).symbol()));
+            symbol = string(abi.encodePacked("vAMM-", erc20(_token0).symbol(), "/", erc20(_token1).symbol()));
+        }
+
+        decimals0 = 10**erc20(_token0).decimals();
+        decimals1 = 10**erc20(_token1).decimals();
+
+        observations.push(Observation(block.timestamp, 0, 0));
+    }
+
+    // simple re-entrancy check
+    uint _unlocked = 1;
+    modifier lock() {
+        require(_unlocked == 1);
+        _unlocked = 2;
+        _;
+        _unlocked = 1;
+    }
+
+    function observationLength() external view returns (uint) {
+        return observations.length;
+    }
+
+    function lastObservation() public view returns (Observation memory) {
+        return observations[observations.length-1];
+    }
+
+    function metadata() external view returns (uint dec0, uint dec1, uint r0, uint r1, bool st, address t0, address t1) {
+        return (decimals0, decimals1, reserve0, reserve1, stable, token0, token1);
+    }
 
     function tokens() external view returns (address, address) {
         return (token0, token1);
@@ -263,6 +197,26 @@ contract BaseV1Pair {
         claimable1[recipient] = 0;
 
         BaseV1Fees(fees).claimFeesFor(recipient, claimed0, claimed1);
+    }
+
+    // Accrue fees on token0
+    function _update0(uint amount) internal {
+        _safeTransfer(token0, fees, amount); // transfer the fees out to BaseV1Fees
+        uint256 _ratio = amount * 1e18 / totalSupply; // 1e18 adjustment is removed during claim
+        if (_ratio > 0) {
+          index0 += _ratio;
+        }
+        emit Fees(msg.sender, amount, 0);
+    }
+
+    // Accrue fees on token1
+    function _update1(uint amount) internal {
+        _safeTransfer(token1, fees, amount);
+        uint256 _ratio = amount * 1e18 / totalSupply;
+        if (_ratio > 0) {
+          index1 += _ratio;
+        }
+        emit Fees(msg.sender, 0, amount);
     }
 
     // this function MUST be called on any balance changes, otherwise can be used to infinitely claim fees
@@ -292,179 +246,68 @@ contract BaseV1Pair {
         }
     }
 
-    function getReserves() public view returns (uint112 _reserve0, uint112 _reserve1, uint32 _blockTimestampLast) {
+    function getReserves() public view returns (uint _reserve0, uint _reserve1, uint _blockTimestampLast) {
         _reserve0 = reserve0;
         _reserve1 = reserve1;
         _blockTimestampLast = blockTimestampLast;
     }
 
-    event Fees(address indexed sender, uint amount0, uint amount1);
-    event Mint(address indexed sender, uint amount0, uint amount1);
-    event Burn(address indexed sender, uint amount0, uint amount1, address indexed to);
-    event Swap(
-        address indexed sender,
-        uint amount0In,
-        uint amount1In,
-        uint amount0Out,
-        uint amount1Out,
-        address indexed to
-    );
-    event Sync(uint112 reserve0, uint112 reserve1);
-
-
-    function _safeTransfer(address token,address to,uint256 value) internal {
-        (bool success, bytes memory data) =
-            token.call(abi.encodeWithSelector(erc20.transfer.selector, to, value));
-        require(success && (data.length == 0 || abi.decode(data, (bool))));
-    }
-
-    function _safeTransferFrom(address token, address from, address to, uint256 value) internal {
-        (bool success, bytes memory data) =
-            token.call(abi.encodeWithSelector(erc20.transferFrom.selector, from, to, value));
-        require(success && (data.length == 0 || abi.decode(data, (bool))));
-    }
-
-    constructor() {
-        uint chainId = block.chainid;
-        DOMAIN_SEPARATOR = keccak256(
-            abi.encode(
-                keccak256('EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)'),
-                keccak256(bytes(name)),
-                keccak256(bytes('1')),
-                chainId,
-                address(this)
-            )
-        );
-
-        (address _token0, address _token1, bool _stable) = BaseV1Factory(msg.sender).getInitializable();
-        (token0, token1, stable) = (_token0, _token1, _stable);
-        fees = address(new BaseV1Fees(_token0, _token1));
-        uint _decimals0 = 1;
-        uint _decimals1 = 1;
-        if (_stable) {
-            _decimals0 = 10**erc20(_token0).decimals();
-            _decimals1 = 10**erc20(_token1).decimals();
-            name = string(abi.encodePacked("StableV1 AMM - ", erc20(_token0).symbol(), "/", erc20(_token1).symbol()));
-            symbol = string(abi.encodePacked("sAMM-", erc20(_token0).symbol(), "/", erc20(_token1).symbol()));
-        } else {
-            name = string(abi.encodePacked("VolatileV1 AMM - ", erc20(_token0).symbol(), "/", erc20(_token1).symbol()));
-            symbol = string(abi.encodePacked("vAMM-", erc20(_token0).symbol(), "/", erc20(_token1).symbol()));
-        }
-        decimals0 = _decimals0;
-        decimals1 = _decimals1;
-
-        observations.push(Observation(uint32(block.timestamp % 2**32), 0, 0));
-    }
-
     // update reserves and, on the first call per block, price accumulators
-    function _update(uint balance0, uint balance1, uint112 _reserve0, uint112 _reserve1) private {
-        require(balance0 <= type(uint112).max && balance1 <= type(uint112).max, 'BaseV1: OVERFLOW');
-        uint32 blockTimestamp = uint32(block.timestamp % 2**32);
-        uint32 timeElapsed = blockTimestamp - blockTimestampLast; // overflow is desired
+    function _update(uint balance0, uint balance1, uint _reserve0, uint _reserve1) internal {
+        uint blockTimestamp = block.timestamp;
+        uint timeElapsed = blockTimestamp - blockTimestampLast; // overflow is desired
         if (timeElapsed > 0 && _reserve0 != 0 && _reserve1 != 0) {
-            price0CumulativeLast += uint(UQ112x112.encode(_reserve1).uqdiv(_reserve0)) * timeElapsed;
-            price1CumulativeLast += uint(UQ112x112.encode(_reserve0).uqdiv(_reserve1)) * timeElapsed;
-            reserve0Last = _reserve0; // save last reserve, allows external liquidity checks to ensure reserves weren't manipulated by flash loans
-            reserve1Last = _reserve1;
+            reserve0CumulativeLast += _reserve0 * timeElapsed;
+            reserve1CumulativeLast += _reserve1 * timeElapsed;
         }
 
         Observation memory _point = lastObservation();
         timeElapsed = blockTimestamp - _point.timestamp; // compare the last observation with current timestamp, if greater than 30 minutes, record a new event
         if (timeElapsed > periodSize) {
-            observations.push(Observation(blockTimestamp, price0CumulativeLast, price1CumulativeLast));
+            observations.push(Observation(blockTimestamp, reserve0CumulativeLast, reserve1CumulativeLast));
         }
-        reserve0 = uint112(balance0);
-        reserve1 = uint112(balance1);
+        reserve0 = balance0;
+        reserve1 = balance1;
         blockTimestampLast = blockTimestamp;
-        emit Sync(uint112(reserve0), uint112(reserve1));
-    }
-
-    // simple re-entrancy check
-    uint _unlocked = 1;
-    modifier lock() {
-        require(_unlocked == 1);
-        _unlocked = 0;
-        _;
-        _unlocked = 1;
-    }
-
-    // returns current timestamp
-    function currentBlockTimestamp() public view returns (uint32) {
-        return uint32(block.timestamp % 2 ** 32);
-    }
-
-    // calculate the price, used for twap oracles, not used for spot price
-    function computeAmountOut(
-        uint priceCumulativeStart, uint priceCumulativeEnd,
-        uint timeElapsed, uint amountIn
-    ) public pure returns (uint amountOut) {
-        // overflow is desired.
-        FixedPoint.uq112x112 memory priceAverage = FixedPoint.uq112x112(
-            uint224((priceCumulativeEnd - priceCumulativeStart) / timeElapsed)
-        );
-        amountOut = priceAverage.mul(amountIn).decode144();
+        emit Sync(reserve0, reserve1);
     }
 
     // produces the cumulative price using counterfactuals to save gas and avoid a call to sync.
-    function currentCumulativePrices() public view returns (uint price0Cumulative, uint price1Cumulative, uint32 blockTimestamp) {
-        blockTimestamp = currentBlockTimestamp();
-        price0Cumulative = price0CumulativeLast;
-        price1Cumulative = price1CumulativeLast;
+    function currentCumulativePrices() public view returns (uint reserve0Cumulative, uint reserve1Cumulative, uint blockTimestamp) {
+        blockTimestamp = block.timestamp;
+        reserve0Cumulative = reserve0CumulativeLast;
+        reserve1Cumulative = reserve1CumulativeLast;
 
         // if time has elapsed since the last update on the pair, mock the accumulated price values
-        (uint112 _reserve0, uint112 _reserve1, uint32 _blockTimestampLast) = getReserves();
+        (uint _reserve0, uint _reserve1, uint _blockTimestampLast) = getReserves();
         if (_blockTimestampLast != blockTimestamp) {
             // subtraction overflow is desired
-            uint32 timeElapsed = blockTimestamp - _blockTimestampLast;
-            // addition overflow is desired
-            // counterfactual
-            price0Cumulative += uint(UQ112x112.encode(_reserve1).uqdiv(_reserve0)) * timeElapsed;
-            // counterfactual
-            price1Cumulative += uint(UQ112x112.encode(_reserve0).uqdiv(_reserve1)) * timeElapsed;
+            uint timeElapsed = blockTimestamp - _blockTimestampLast;
+            reserve0Cumulative += _reserve0 * timeElapsed;
+            reserve1Cumulative += _reserve1 * timeElapsed;
         }
     }
 
     // gives the current twap price measured from amountIn * tokenIn gives amountOut
     function current(address tokenIn, uint amountIn) external view returns (uint amountOut) {
         Observation memory _observation = lastObservation();
-        (uint price0Cumulative, uint price1Cumulative,) = currentCumulativePrices();
+        (uint reserve0Cumulative, uint reserve1Cumulative,) = currentCumulativePrices();
         if (block.timestamp == _observation.timestamp) {
             _observation = observations[observations.length-2];
         }
 
         uint timeElapsed = block.timestamp - _observation.timestamp;
-        timeElapsed = timeElapsed == 0 ? 1 : timeElapsed;
-        if (token0 == tokenIn) {
-            return computeAmountOut(_observation.price0Cumulative, price0Cumulative, timeElapsed, amountIn);
-        } else {
-            return computeAmountOut(_observation.price1Cumulative, price1Cumulative, timeElapsed, amountIn);
-        }
+        uint _reserve0 = (reserve0Cumulative - _observation.reserve0Cumulative) / timeElapsed;
+        uint _reserve1 = (reserve1Cumulative - _observation.reserve1Cumulative) / timeElapsed;
+        amountOut = _getAmountOut(amountIn, tokenIn, _reserve0, _reserve1);
     }
 
     // as per `current`, however allows user configured granularity, up to the full window size
     function quote(address tokenIn, uint amountIn, uint granularity) external view returns (uint amountOut) {
-        uint priceAverageCumulative = 0;
-        uint length = observations.length-1;
-        uint i = length - granularity;
-
-
-        uint nextIndex = 0;
-        if (token0 == tokenIn) {
-            for (; i < length; i++) {
-                nextIndex = i+1;
-                priceAverageCumulative += computeAmountOut(
-                    observations[i].price0Cumulative,
-                    observations[nextIndex].price0Cumulative,
-                    observations[nextIndex].timestamp - observations[i].timestamp, amountIn);
-            }
-        } else {
-            for (; i < length; i++) {
-                nextIndex = i+1;
-                priceAverageCumulative += computeAmountOut(
-                    observations[i].price1Cumulative,
-                    observations[nextIndex].price1Cumulative,
-                    observations[nextIndex].timestamp - observations[i].timestamp, amountIn);
-            }
+        uint [] memory _prices = sample(tokenIn, amountIn, granularity, 1);
+        uint priceAverageCumulative;
+        for (uint i = 0; i < _prices.length; i++) {
+            priceAverageCumulative += _prices[i];
         }
         return priceAverageCumulative / granularity;
     }
@@ -482,24 +325,13 @@ contract BaseV1Pair {
         uint nextIndex = 0;
         uint index = 0;
 
-        if (token0 == tokenIn) {
-            for (; i < length; i+=window) {
-                nextIndex = i + window;
-                _prices[index] = computeAmountOut(
-                    observations[i].price0Cumulative,
-                    observations[nextIndex].price0Cumulative,
-                    observations[nextIndex].timestamp - observations[i].timestamp, amountIn);
-                index = index + 1;
-            }
-        } else {
-            for (; i < length; i+=window) {
-                nextIndex = i + window;
-                _prices[index] = computeAmountOut(
-                    observations[i].price1Cumulative,
-                    observations[nextIndex].price1Cumulative,
-                    observations[nextIndex].timestamp - observations[i].timestamp, amountIn);
-                index = index + 1;
-            }
+        for (; i < length; i+=window) {
+            nextIndex = i + window;
+            uint timeElapsed = observations[nextIndex].timestamp - observations[i].timestamp;
+            uint _reserve0 = (observations[nextIndex].reserve0Cumulative - observations[i].reserve0Cumulative) / timeElapsed;
+            uint _reserve1 = (observations[nextIndex].reserve1Cumulative - observations[i].reserve1Cumulative) / timeElapsed;
+            _prices[index] = _getAmountOut(amountIn, tokenIn, _reserve0, _reserve1);
+            index = index + 1;
         }
         return _prices;
     }
@@ -507,7 +339,7 @@ contract BaseV1Pair {
     // this low-level function should be called from a contract which performs important safety checks
     // standard uniswap v2 implementation
     function mint(address to) external lock returns (uint liquidity) {
-        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
+        (uint _reserve0, uint _reserve1) = (reserve0, reserve1);
         uint _balance0 = erc20(token0).balanceOf(address(this));
         uint _balance1 = erc20(token1).balanceOf(address(this));
         uint _amount0 = _balance0 - _reserve0;
@@ -530,9 +362,8 @@ contract BaseV1Pair {
     // this low-level function should be called from a contract which performs important safety checks
     // standard uniswap v2 implementation
     function burn(address to) external lock returns (uint amount0, uint amount1) {
-        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
-        address _token0 = token0;                                // gas savings
-        address _token1 = token1;                                // gas savings
+        (uint _reserve0, uint _reserve1) = (reserve0, reserve1);
+        (address _token0, address _token1) = (token0, token1);
         uint _balance0 = erc20(_token0).balanceOf(address(this));
         uint _balance1 = erc20(_token1).balanceOf(address(this));
         uint _liquidity = balanceOf[address(this)];
@@ -554,14 +385,13 @@ contract BaseV1Pair {
     // this low-level function should be called from a contract which performs important safety checks
     function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external lock {
         require(amount0Out > 0 || amount1Out > 0, 'IOA'); // BaseV1: INSUFFICIENT_OUTPUT_AMOUNT
-        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
-        require(amount0Out < _reserve0 && amount1Out < _reserve1, 'BaseV1: INSUFFICIENT_LIQUIDITY');
+        (uint _reserve0, uint _reserve1) =  (reserve0, reserve1);
+        require(amount0Out < _reserve0 && amount1Out < _reserve1, 'IL'); // BaseV1: INSUFFICIENT_LIQUIDITY
 
         uint _balance0;
         uint _balance1;
         { // scope for _token{0,1}, avoids stack too deep errors
-        address _token0 = token0;
-        address _token1 = token1;
+        (address _token0, address _token1) = (token0, token1);
         require(to != _token0 && to != _token1, 'IT'); // BaseV1: INVALID_TO
         if (amount0Out > 0) _safeTransfer(_token0, to, amount0Out); // optimistically transfer tokens
         if (amount1Out > 0) _safeTransfer(_token1, to, amount1Out); // optimistically transfer tokens
@@ -573,8 +403,7 @@ contract BaseV1Pair {
         uint amount1In = _balance1 > _reserve1 - amount1Out ? _balance1 - (_reserve1 - amount1Out) : 0;
         require(amount0In > 0 || amount1In > 0, 'IIA'); // BaseV1: INSUFFICIENT_INPUT_AMOUNT
         { // scope for reserve{0,1}Adjusted, avoids stack too deep errors
-        address _token0 = token0;
-        address _token1 = token1;
+        (address _token0, address _token1) = (token0, token1);
         if (amount0In > 0) _update0(amount0In / 10000); // accrue fees for token0 and move them out of pool
         if (amount1In > 0) _update1(amount1In / 10000); // accrue fees for token1 and move them out of pool
         _balance0 = erc20(_token0).balanceOf(address(this)); // since we removed tokens, we need to reconfirm balances, can also simply use previous balance - amountIn/ 10000, but doing balanceOf again as safety check
@@ -589,8 +418,7 @@ contract BaseV1Pair {
 
     // force balances to match reserves
     function skim(address to) external lock {
-        address _token0 = token0; // gas savings
-        address _token1 = token1; // gas savings
+        (address _token0, address _token1) = (token0, token1);
         _safeTransfer(_token0, to, erc20(_token0).balanceOf(address(this)) - (reserve0));
         _safeTransfer(_token1, to, erc20(_token1).balanceOf(address(this)) - (reserve1));
     }
@@ -600,78 +428,62 @@ contract BaseV1Pair {
         _update(erc20(token0).balanceOf(address(this)), erc20(token1).balanceOf(address(this)), reserve0, reserve1);
     }
 
-    function _x4(uint x) internal pure returns (uint) {
-        return x*x/1e18*x/1e18*x/1e18;
+    function _f(uint x0, uint xy, uint y) internal pure returns (uint) {
+        return x0*(y*y/1e18*y/1e18)/1e18+(x0*x0/1e18*x0/1e18)*y/1e18-xy;
     }
 
-    function _x3(uint x) internal pure returns (uint) {
-        return x*x/1e18*x/1e18;
+    function _d(uint x0, uint y) internal pure returns (uint) {
+        return 3*x0*(y*y/1e18)/1e18+(x0*x0/1e18*x0/1e18);
     }
 
-    function _x9(uint x) internal pure returns (uint) {
-        return _x4(x)*x/1e18*x/1e18*x/1e18*x/1e18*x/1e18;
-    }
-
-    function _x12(uint x) internal pure returns (uint) {
-        return _x9(x)*x/1e18*x/1e18*x/1e18;
-    }
-
-    function _c0(uint a, uint b, uint x) internal pure returns (uint) {
-        uint a3 = a*a/1e18*a/1e18;
-        uint b3 = b*b/1e18*b/1e18;
-        uint x2 = x*x/1e18;
-        return 27*a3*b/1e18*x2/1e18+27*a*b3/1e18*x2/1e18;
-    }
-
-    function _c1(uint x, uint c0) internal pure returns (uint) {
-        uint x12 = _x12(x);
-        return (Math.sqrt(c0*c0+108e18*x12)+c0);
-    }
-
-    // Math.cbrt(2e54) = 1259921049894873164
-    function _get_y(uint xIn, uint a, uint b) internal view returns (uint amountOut) {
-        xIn = xIn * 1e18 / decimals0;
-        a = a * 1e18 / decimals0;
-        b = b * 1e18 / decimals1;
-        uint x = xIn+a;
-        uint c1 = 0;
-        uint b1 = 0;
-        uint b2 = 0;
-        {
-            uint c0 = _c0(a, b, x);
-            c1 = _c1(x, c0);
-            c1 = Math.cbrt(c1*1e36)*1e18;
-            b1 = 3e18*Math.cbrt(2e54)/1e18*x/1e18;
-            b2 = (Math.cbrt(2e54)*_x3(x))*1e18;
+    function _get_y(uint x0, uint xy, uint y) internal pure returns (uint) {
+        for (uint i = 0; i < 255; i++) {
+            uint y_prev = y;
+            y = y - (_f(x0,xy,y)*1e18/_d(x0,y));
+            if (y > y_prev) {
+                if (y - y_prev <= 1) {
+                    return y;
+                }
+            } else {
+                if (y_prev - y <= 1) {
+                    return y;
+                }
+            }
         }
-
-        uint y0 = c1/b1-b2/c1;
-        return (b - y0);
+        return y;
     }
 
     function getAmountOut(uint amountIn, address tokenIn) external view returns (uint) {
-      (uint _reserve0, uint _reserve1,) = getReserves();
-      amountIn -= amountIn / 10000; // remove fee from amount received
-      if (stable) {
-          (uint reserveA, uint reserveB) = tokenIn == token0 ? (_reserve0, _reserve1) : (_reserve1, _reserve0);
-          uint y = _get_y(amountIn, reserveA, reserveB);
-          return y * (tokenIn == token0 ? decimals1 : decimals0) / 1e18;
-      } else {
-          (uint reserveA, uint reserveB) = tokenIn == token0 ? (_reserve0, _reserve1) : (_reserve1, _reserve0);
-          return amountIn * reserveB / (reserveA + amountIn);
-      }
+        (uint _reserve0, uint _reserve1) = (reserve0, reserve1);
+        amountIn -= amountIn / 10000; // remove fee from amount received
+        return _getAmountOut(amountIn, tokenIn, _reserve0, _reserve1);
+    }
+
+    function _getAmountOut(uint amountIn, address tokenIn, uint _reserve0, uint _reserve1) internal view returns (uint) {
+        if (stable) {
+            uint xy =  _k(_reserve0, _reserve1);
+            _reserve0 = _reserve0 * 1e18 / decimals0;
+            _reserve1 = _reserve1 * 1e18 / decimals1;
+            (uint reserveA, uint reserveB) = tokenIn == token0 ? (_reserve0, _reserve1) : (_reserve1, _reserve0);
+            amountIn = tokenIn == token0 ? amountIn * 1e18 / decimals0 : amountIn * 1e18 / decimals1;
+            uint y = reserveB - _get_y(amountIn+reserveA, xy, reserveB);
+            return y * (tokenIn == token0 ? decimals1 : decimals0) / 1e18;
+        } else {
+            (uint reserveA, uint reserveB) = tokenIn == token0 ? (_reserve0, _reserve1) : (_reserve1, _reserve0);
+            return amountIn * reserveB / (reserveA + amountIn);
+        }
     }
 
     function _k(uint x, uint y) internal view returns (uint) {
-      if (stable) {
-          uint _x = x * 1e18 / decimals0;
-          uint _y = y * 1e18 / decimals1;
-          uint _a = (_x * _y) / 1e18;
-          uint _b = ((_x * _x) / 1e18 + (_y * _y) / 1e18);
-          return _a * _b / 1e18 / 2;  // x3y+y3x >= k
-      } else {
-          return x * y; // xy >= k
-      }
+        if (stable) {
+            uint _x = x * 1e18 / decimals0;
+            uint _y = y * 1e18 / decimals1;
+            uint _a = (_x * _y) / 1e18;
+            uint _b = ((_x * _x) / 1e18 + (_y * _y) / 1e18);
+            return _a * _b / 1e18;  // x3y+y3x >= k
+        } else {
+            return x * y; // xy >= k
+        }
     }
 
     function _mint(address dst, uint amount) internal {
@@ -697,6 +509,15 @@ contract BaseV1Pair {
 
     function permit(address owner, address spender, uint value, uint deadline, uint8 v, bytes32 r, bytes32 s) external {
         require(deadline >= block.timestamp, 'BaseV1: EXPIRED');
+        DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                keccak256('EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)'),
+                keccak256(bytes(name)),
+                keccak256(bytes('1')),
+                block.chainid,
+                address(this)
+            )
+        );
         bytes32 digest = keccak256(
             abi.encodePacked(
                 '\x19\x01',
@@ -740,6 +561,18 @@ contract BaseV1Pair {
 
         emit Transfer(src, dst, amount);
     }
+
+    function _safeTransfer(address token,address to,uint256 value) internal {
+        (bool success, bytes memory data) =
+            token.call(abi.encodeWithSelector(erc20.transfer.selector, to, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))));
+    }
+
+    function _safeTransferFrom(address token, address from, address to, uint256 value) internal {
+        (bool success, bytes memory data) =
+            token.call(abi.encodeWithSelector(erc20.transferFrom.selector, from, to, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))));
+    }
 }
 
 contract BaseV1Factory {
@@ -772,9 +605,7 @@ contract BaseV1Factory {
         require(token0 != address(0), 'ZA'); // BaseV1: ZERO_ADDRESS
         require(getPair[token0][token1][stable] == address(0), 'PE'); // BaseV1: PAIR_EXISTS - single check is sufficient
         bytes32 salt = keccak256(abi.encodePacked(token0, token1, stable)); // notice salt includes stable as well, 3 parameters
-        _temp0 = token0;
-        _temp1 = token1;
-        _temp = stable;
+        (_temp0, _temp1, _temp) = (token0, token1, stable);
         pair = address(new BaseV1Pair{salt:salt}());
         getPair[token0][token1][stable] = pair;
         getPair[token1][token0][stable] = pair; // populate mapping in the reverse direction

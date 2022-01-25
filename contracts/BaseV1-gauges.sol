@@ -40,18 +40,18 @@ interface IBribe {
 }
 
 // Gauges are used to incentivize pools, they emit reward tokens over 7 days for staked LP tokens
-// Nuance: getReward must be called at least once for tokens other than incentive[0] to start accrueing rewards
 contract Gauge {
 
     address public immutable stake; // the LP token that needs to be staked for rewards
     address public immutable _ve; // the ve token used for gauges
     address public immutable bribe;
+    address public immutable voter;
 
     uint public derivedSupply;
     mapping(address => uint) public derivedBalances;
 
-    uint public constant DURATION = 7 days; // rewards are released over 7 days
-    uint public constant PRECISION = 10 ** 18;
+    uint constant DURATION = 7 days; // rewards are released over 7 days
+    uint constant PRECISION = 10 ** 18;
 
     // default snx staking contract implementation
     mapping(address => uint) public rewardRate;
@@ -61,6 +61,7 @@ contract Gauge {
 
     mapping(address => mapping(address => uint)) public lastEarn;
     mapping(address => mapping(address => uint)) public userRewardPerTokenStored;
+    mapping(address => mapping(address => uint)) public userRewards;
 
     mapping(address => uint) public tokenIds;
 
@@ -79,55 +80,57 @@ contract Gauge {
         IBribe(bribe).notifyRewardAmount(_token1, claimed1);
     }
 
+
     /// @notice A checkpoint for marking balance
-   struct Checkpoint {
+    struct Checkpoint {
        uint timestamp;
        uint balanceOf;
-   }
+    }
 
-  /// @notice A checkpoint for marking reward rate
- struct RewardPerTokenCheckpoint {
-     uint timestamp;
-     uint rewardPerToken;
- }
+    /// @notice A checkpoint for marking reward rate
+    struct RewardPerTokenCheckpoint {
+       uint timestamp;
+       uint rewardPerToken;
+    }
 
-  /// @notice A checkpoint for marking supply
- struct SupplyCheckpoint {
-     uint timestamp;
-     uint supply;
- }
+    /// @notice A checkpoint for marking supply
+    struct SupplyCheckpoint {
+       uint timestamp;
+       uint supply;
+    }
 
-   /// @notice A record of balance checkpoints for each account, by index
-   mapping (address => mapping (uint => Checkpoint)) public checkpoints;
+    /// @notice A record of balance checkpoints for each account, by index
+    mapping (address => mapping (uint => Checkpoint)) public checkpoints;
 
-   /// @notice The number of checkpoints for each account
-   mapping (address => uint) public numCheckpoints;
+    /// @notice The number of checkpoints for each account
+    mapping (address => uint) public numCheckpoints;
 
-   /// @notice A record of balance checkpoints for each token, by index
-   mapping (uint => SupplyCheckpoint) public supplyCheckpoints;
+    /// @notice A record of balance checkpoints for each token, by index
+    mapping (uint => SupplyCheckpoint) public supplyCheckpoints;
 
-   /// @notice The number of checkpoints
-   uint public supplyNumCheckpoints;
+    /// @notice The number of checkpoints
+    uint public supplyNumCheckpoints;
 
-   /// @notice A record of balance checkpoints for each token, by index
-   mapping (address => mapping (uint => RewardPerTokenCheckpoint)) public rewardPerTokenCheckpoints;
+    /// @notice A record of balance checkpoints for each token, by index
+    mapping (address => mapping (uint => RewardPerTokenCheckpoint)) public rewardPerTokenCheckpoints;
 
-   /// @notice The number of checkpoints for each token
-   mapping (address => uint) public rewardPerTokenNumCheckpoints;
+    /// @notice The number of checkpoints for each token
+    mapping (address => uint) public rewardPerTokenNumCheckpoints;
 
     // simple re-entrancy check
     uint _unlocked = 1;
     modifier lock() {
         require(_unlocked == 1);
-        _unlocked = 0;
+        _unlocked = 2;
         _;
         _unlocked = 1;
     }
 
-    constructor(address _stake, address _bribe, address  __ve) {
+    constructor(address _stake, address _bribe, address  __ve, address _voter) {
         stake = _stake;
         bribe = _bribe;
         _ve = __ve;
+        voter = _voter;
     }
 
     /**
@@ -277,22 +280,31 @@ contract Gauge {
         return Math.min(block.timestamp, periodFinish[token]);
     }
 
+    function batchUserRewards(address token, address account, uint maxRuns) external {
+        (rewardPerTokenStored[token], lastUpdateTime[token]) = _updateRewardPerToken(token);
+        (userRewards[token][account], lastEarn[token][account]) = _batchUserRewards(token, account, maxRuns);
+    }
+
     function getReward(address account, address[] memory tokens) public lock {
-      for (uint i = 0; i < tokens.length; i++) {
-          uint _reward = earned(tokens[i], account);
-          lastEarn[tokens[i]][account] = block.timestamp;
-          userRewardPerTokenStored[tokens[i]][account] = rewardPerToken(tokens[i]);
-          if (_reward > 0) _safeTransfer(tokens[i], account, _reward);
-      }
+        require(msg.sender == account || msg.sender == voter);
+        for (uint i = 0; i < tokens.length; i++) {
+            (rewardPerTokenStored[tokens[i]], lastUpdateTime[tokens[i]]) = _updateRewardPerToken(tokens[i]);
 
-      uint _derivedBalance = derivedBalances[account];
-      derivedSupply -= _derivedBalance;
-      _derivedBalance = derivedBalance(account);
-      derivedBalances[account] = _derivedBalance;
-      derivedSupply += _derivedBalance;
+            uint _reward = earned(tokens[i], account);
+            userRewards[tokens[i]][account] = 0;
+            lastEarn[tokens[i]][account] = block.timestamp;
+            userRewardPerTokenStored[tokens[i]][account] = rewardPerTokenStored[tokens[i]];
+            if (_reward > 0) _safeTransfer(tokens[i], account, _reward);
+        }
 
-      _writeCheckpoint(account, derivedBalances[account]);
-      _writeSupplyCheckpoint();
+        uint _derivedBalance = derivedBalances[account];
+        derivedSupply -= _derivedBalance;
+        _derivedBalance = derivedBalance(account);
+        derivedBalances[account] = _derivedBalance;
+        derivedSupply += _derivedBalance;
+
+        _writeCheckpoint(account, derivedBalances[account]);
+        _writeSupplyCheckpoint();
     }
 
 
@@ -300,7 +312,7 @@ contract Gauge {
         if (derivedSupply == 0) {
             return rewardPerTokenStored[token];
         }
-        return rewardPerTokenStored[token] + ((lastTimeRewardApplicable(token) - lastUpdateTime[token]) * rewardRate[token] * PRECISION / derivedSupply);
+        return rewardPerTokenStored[token] + ((lastTimeRewardApplicable(token) - Math.min(lastUpdateTime[token], periodFinish[token])) * rewardRate[token] * PRECISION / derivedSupply);
     }
 
     function derivedBalance(address account) public view returns (uint) {
@@ -312,57 +324,111 @@ contract Gauge {
             _adjusted = ve(_ve).balanceOfNFT(_tokenId);
             _adjusted = (totalSupply * _adjusted / erc20(_ve).totalSupply()) * 60 / 100;
         }
-        return Math.min(_derived + _adjusted, _balance);
+        return Math.min((_derived + _adjusted), _balance);
     }
 
-    function _updateRewardPerToken(address token) internal returns (uint) {
+    function _batchUserRewards(address token, address account, uint maxRuns) internal view returns (uint, uint) {
+        uint _startTimestamp = lastEarn[token][account];
+        if (numCheckpoints[account] == 0) {
+            return (userRewards[token][account], _startTimestamp);
+        }
+
+        uint _startIndex = getPriorBalanceIndex(account, _startTimestamp);
+        uint _endIndex = Math.min(numCheckpoints[account]-1, maxRuns);
+
+        uint reward = userRewards[token][account];
+        for (uint i = _startIndex; i < _endIndex; i++) {
+            Checkpoint memory cp0 = checkpoints[account][i];
+            Checkpoint memory cp1 = checkpoints[account][i+1];
+            (uint _rewardPerTokenStored0,) = getPriorRewardPerToken(token, cp0.timestamp);
+            (uint _rewardPerTokenStored1,) = getPriorRewardPerToken(token, cp1.timestamp);
+            reward += cp0.balanceOf * (_rewardPerTokenStored1 - _rewardPerTokenStored0) / PRECISION;
+            _startTimestamp = cp1.timestamp;
+        }
+
+        return (reward, _startTimestamp);
+    }
+
+    function batchRewardPerToken(address token, uint maxRuns) external {
+        (rewardPerTokenStored[token], lastUpdateTime[token])  = _batchRewardPerToken(token, maxRuns);
+    }
+
+    function _batchRewardPerToken(address token, uint maxRuns) internal returns (uint, uint) {
         uint _startTimestamp = lastUpdateTime[token];
         uint reward = rewardPerTokenStored[token];
 
         if (supplyNumCheckpoints == 0) {
-            return reward;
+            return (reward, _startTimestamp);
+        }
+
+        uint _startIndex = getPriorSupplyIndex(_startTimestamp);
+        uint _endIndex = Math.min(supplyNumCheckpoints-1, maxRuns);
+
+        for (uint i = _startIndex; i < _endIndex; i++) {
+            SupplyCheckpoint memory sp0 = supplyCheckpoints[i];
+            if (sp0.supply > 0) {
+                SupplyCheckpoint memory sp1 = supplyCheckpoints[i+1];
+                (uint _reward, uint _endTime) = _calcRewardPerToken(token, sp1.timestamp, sp0.timestamp, sp0.supply, _startTimestamp);
+                reward += _reward;
+                _writeRewardPerTokenCheckpoint(token, reward, _endTime);
+                _startTimestamp = _endTime;
+            }
+        }
+
+        return (reward, _startTimestamp);
+    }
+
+    function _calcRewardPerToken(address token, uint timestamp1, uint timestamp0, uint supply, uint startTimestamp) internal view returns (uint, uint) {
+        uint endTime = Math.max(timestamp1, startTimestamp);
+        return (((Math.min(endTime, periodFinish[token]) - Math.min(Math.max(timestamp0, startTimestamp), periodFinish[token])) * rewardRate[token] * PRECISION / supply), endTime);
+    }
+
+    function _updateRewardPerToken(address token) internal returns (uint, uint) {
+        uint _startTimestamp = lastUpdateTime[token];
+        uint reward = rewardPerTokenStored[token];
+
+        if (supplyNumCheckpoints == 0) {
+            return (reward, _startTimestamp);
         }
 
         uint _startIndex = getPriorSupplyIndex(_startTimestamp);
         uint _endIndex = supplyNumCheckpoints-1;
-        uint _rewardRate = rewardRate[token];
 
         if (_endIndex - _startIndex > 1) {
             for (uint i = _startIndex; i < _endIndex-1; i++) {
                 SupplyCheckpoint memory sp0 = supplyCheckpoints[i];
-                if (i == _startIndex) {
-                    sp0.timestamp = Math.max(sp0.timestamp, _startTimestamp);
-                }
-                SupplyCheckpoint memory sp1 = supplyCheckpoints[i+1];
-                if (_rewardRate > 0 && sp0.supply > 0) {
-                  reward += ((sp1.timestamp - sp0.timestamp) * _rewardRate * PRECISION / sp0.supply);
-                  _writeRewardPerTokenCheckpoint(token, reward, sp1.timestamp);
+                if (sp0.supply > 0) {
+                  SupplyCheckpoint memory sp1 = supplyCheckpoints[i+1];
+                  (uint _reward, uint _endTime) = _calcRewardPerToken(token, sp1.timestamp, sp0.timestamp, sp0.supply, _startTimestamp);
+                  reward += _reward;
+                  _writeRewardPerTokenCheckpoint(token, reward, _endTime);
+                  _startTimestamp = _endTime;
                 }
             }
         }
 
         SupplyCheckpoint memory sp = supplyCheckpoints[_endIndex];
-        if (_endIndex == _startIndex) {
-            sp.timestamp = Math.max(sp.timestamp, _startTimestamp);
-        }
-        if (_rewardRate > 0 && sp.supply > 0) {
-            reward += ((lastTimeRewardApplicable(token) - sp.timestamp) * _rewardRate * PRECISION / sp.supply);
-            _writeRewardPerTokenCheckpoint(token, reward, lastTimeRewardApplicable(token));
+        if (sp.supply > 0) {
+            (uint _reward,) = _calcRewardPerToken(token, lastTimeRewardApplicable(token), Math.max(sp.timestamp, _startTimestamp), sp.supply, _startTimestamp);
+            reward += _reward;
+            _writeRewardPerTokenCheckpoint(token, reward, block.timestamp);
+            _startTimestamp = block.timestamp;
         }
 
-        return reward;
+        return (reward, _startTimestamp);
     }
 
+    // earned is an estimation, it won't be exact till the supply > rewardPerToken calculations have run
     function earned(address token, address account) public view returns (uint) {
         uint _startTimestamp = lastEarn[token][account];
         if (numCheckpoints[account] == 0) {
-            return 0;
+            return userRewards[token][account];
         }
 
         uint _startIndex = getPriorBalanceIndex(account, _startTimestamp);
         uint _endIndex = numCheckpoints[account]-1;
 
-        uint reward = 0;
+        uint reward = userRewards[token][account];
 
         if (_endIndex - _startIndex > 1) {
             for (uint i = _startIndex; i < _endIndex-1; i++) {
@@ -370,7 +436,7 @@ contract Gauge {
                 Checkpoint memory cp1 = checkpoints[account][i+1];
                 (uint _rewardPerTokenStored0,) = getPriorRewardPerToken(token, cp0.timestamp);
                 (uint _rewardPerTokenStored1,) = getPriorRewardPerToken(token, cp1.timestamp);
-                reward += (cp0.balanceOf * _rewardPerTokenStored1 - _rewardPerTokenStored0) / PRECISION;
+                reward += cp0.balanceOf * (_rewardPerTokenStored1 - _rewardPerTokenStored0) / PRECISION;
             }
         }
 
@@ -393,7 +459,7 @@ contract Gauge {
         derivedBalances[msg.sender] = _derivedBalance;
         derivedSupply += _derivedBalance;
 
-        _writeCheckpoint(msg.sender, derivedBalances[msg.sender]);
+        _writeCheckpoint(msg.sender, _derivedBalance);
         _writeSupplyCheckpoint();
     }
 
@@ -413,10 +479,14 @@ contract Gauge {
         _writeSupplyCheckpoint();
     }
 
+    function left(address token) external view returns (uint) {
+        if (block.timestamp >= periodFinish[token]) return 0;
+        uint _remaining = periodFinish[token] - block.timestamp;
+        return _remaining * rewardRate[token];
+    }
+
     function notifyRewardAmount(address token, uint amount) external lock {
-        rewardPerTokenStored[token] = _updateRewardPerToken(token);
-        lastUpdateTime[token] = block.timestamp;
-        _writeRewardPerTokenCheckpoint(token, rewardPerTokenStored[token], lastUpdateTime[token]);
+        (rewardPerTokenStored[token], lastUpdateTime[token]) = _updateRewardPerToken(token);
 
         if (block.timestamp >= periodFinish[token]) {
             _safeTransferFrom(token, msg.sender, address(this), amount);
@@ -428,6 +498,7 @@ contract Gauge {
             _safeTransferFrom(token, msg.sender, address(this), amount);
             rewardRate[token] = (amount + _left) / DURATION;
         }
+        require(rewardRate[token] > 0);
         periodFinish[token] = block.timestamp + DURATION;
         if (!isReward[token]) {
             isReward[token] = true;
@@ -455,7 +526,34 @@ contract Gauge {
 }
 
 contract BaseV1GaugeFactory {
+    address public last_gauge;
+    address[] public gauges;    
+    uint256 public gaugesLength;
+    mapping(address => address[]) public gaugesByPoolAddress;
+    mapping(address => address[]) public gaugesByBribeAddress;
+    mapping(address => address[]) public gaugesByVeAddress;
+    mapping(address => address[]) public gaugesByVoterAddress;
+    mapping(address => uint256) public gaugesByPoolAddressLength;
+    mapping(address => uint256) public gaugesByBribeAddressLength;
+    mapping(address => uint256) public gaugesByVeAddressLength;
+    mapping(address => uint256) public gaugesByVoterAddressLength;
+    
     function createGauge(address _pool, address _bribe, address _ve) external returns (address) {
-        return address(new Gauge(_pool, _bribe, _ve));
+        last_gauge = address(new Gauge(_pool, _bribe, _ve, msg.sender));
+        registerGauge(last_gauge, _pool, _bribe, _ve, msg.sender);
+        return last_gauge;
+    }
+    
+    function registerGauge(address _gauge, address _pool, address _bribe, address _ve, address _voter) internal {
+        gauges.push(_gauge);
+        gaugesByPoolAddress[_pool].push(_gauge);
+        gaugesByBribeAddress[_bribe].push(_gauge);
+        gaugesByVeAddress[_ve].push(_gauge);
+        gaugesByVoterAddress[_voter].push(_gauge);
+        gaugesLength++;
+        gaugesByPoolAddressLength[_pool]++;
+        gaugesByBribeAddressLength[_bribe]++;
+        gaugesByVeAddressLength[_ve]++;
+        gaugesByVoterAddressLength[_voter]++;
     }
 }

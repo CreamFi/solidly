@@ -60,9 +60,9 @@ interface IWFTM {
 contract BaseV1Router01 {
 
     struct route {
-      address from;
-      address to;
-      bool stable;
+        address from;
+        address to;
+        bool stable;
     }
 
     address public immutable factory;
@@ -122,7 +122,7 @@ contract BaseV1Router01 {
         amounts = new uint[](routes.length+1);
         amounts[0] = amountIn;
         for (uint i = 0; i < routes.length; i++) {
-            amounts[i+1] = IBaseV1Pair(pairFor(routes[i].from, routes[i].to, routes[i].stable)).getAmountOut(amountIn, routes[i].from);
+            amounts[i+1] = IBaseV1Pair(pairFor(routes[i].from, routes[i].to, routes[i].stable)).getAmountOut(amounts[i], routes[i].from);
         }
     }
 
@@ -192,6 +192,8 @@ contract BaseV1Router01 {
         uint amountAMin,
         uint amountBMin
     ) internal returns (uint amountA, uint amountB) {
+        require(amountADesired >= amountAMin);
+        require(amountBDesired >= amountBMin);
         // create the pair if it doesn't exist yet
         address _pair = IBaseV1Factory(factory).getPair(tokenA, tokenB, stable);
         if (_pair == address(0)) {

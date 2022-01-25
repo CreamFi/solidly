@@ -43,10 +43,10 @@ interface IGauge {
     function notifyRewardAmount(address token, uint amount) external;
     function getReward(address account, address[] memory tokens) external;
     function claimFees() external returns (uint claimed0, uint claimed1);
+    function left(address token) external view returns (uint);
 }
 
 // Bribes pay out rewards for a given pool based on the votes that were received from the user (goes hand in hand with BaseV1Gauges.vote())
-// Nuance: users must call updateReward after they voted for a given bribe
 contract Bribe {
 
     address public immutable factory; // only factory can modify balances (since it only happens on vote())
@@ -63,6 +63,7 @@ contract Bribe {
 
     mapping(address => mapping(uint => uint)) public lastEarn;
     mapping(address => mapping(uint => uint)) public userRewardPerTokenStored;
+    mapping(address => mapping(uint => uint)) public userRewards;
 
     address[] public rewards;
     mapping(address => bool) public isReward;
@@ -110,9 +111,14 @@ contract Bribe {
     uint _unlocked = 1;
     modifier lock() {
         require(_unlocked == 1);
-        _unlocked = 0;
+        _unlocked = 2;
         _;
         _unlocked = 1;
+    }
+
+    constructor() {
+        factory = msg.sender;
+        _ve = BaseV1Voter(msg.sender)._ve();
     }
 
     /**
@@ -262,90 +268,148 @@ contract Bribe {
         return Math.min(block.timestamp, periodFinish[token]);
     }
 
+    function batchUserRewards(address token, uint tokenId, uint maxRuns) external {
+        (rewardPerTokenStored[token], lastUpdateTime[token]) = _updateRewardPerToken(token);
+        (userRewards[token][tokenId], lastEarn[token][tokenId]) = _batchUserRewards(token, tokenId, maxRuns);
+    }
+
     // allows a user to claim rewards for a given token
     function getReward(uint tokenId, address[] memory tokens) public lock  {
         require(ve(_ve).isApprovedOrOwner(msg.sender, tokenId));
         for (uint i = 0; i < tokens.length; i++) {
+            (rewardPerTokenStored[tokens[i]], lastUpdateTime[tokens[i]]) = _updateRewardPerToken(tokens[i]);
+
             uint _reward = earned(tokens[i], tokenId);
+            userRewards[tokens[i]][tokenId] = 0;
             lastEarn[tokens[i]][tokenId] = block.timestamp;
-            userRewardPerTokenStored[tokens[i]][tokenId] = rewardPerToken(tokens[i]);
+            userRewardPerTokenStored[tokens[i]][tokenId] = rewardPerTokenStored[tokens[i]];
             if (_reward > 0) _safeTransfer(tokens[i], msg.sender, _reward);
         }
     }
 
-    // allows a user to claim rewards for a given token
+    // used by BaseV1Voter to allow batched reward claims
     function getRewardForOwner(uint tokenId, address[] memory tokens) public lock  {
+        require(msg.sender == factory);
         address _owner = ve(_ve).ownerOf(tokenId);
         for (uint i = 0; i < tokens.length; i++) {
+            (rewardPerTokenStored[tokens[i]], lastUpdateTime[tokens[i]]) = _updateRewardPerToken(tokens[i]);
+
             uint _reward = earned(tokens[i], tokenId);
+            userRewards[tokens[i]][tokenId] = 0;
             lastEarn[tokens[i]][tokenId] = block.timestamp;
-            userRewardPerTokenStored[tokens[i]][tokenId] = rewardPerToken(tokens[i]);
+            userRewardPerTokenStored[tokens[i]][tokenId] = rewardPerTokenStored[tokens[i]];
             if (_reward > 0) _safeTransfer(tokens[i], _owner, _reward);
         }
-    }
-
-
-    constructor() {
-        factory = msg.sender;
-        _ve = BaseV1Voter(msg.sender)._ve();
     }
 
     function rewardPerToken(address token) public view returns (uint) {
         if (totalSupply == 0) {
             return rewardPerTokenStored[token];
         }
-        return rewardPerTokenStored[token] + ((lastTimeRewardApplicable(token) - lastUpdateTime[token]) * rewardRate[token] * PRECISION / totalSupply);
+        return rewardPerTokenStored[token] + ((lastTimeRewardApplicable(token) - Math.min(lastUpdateTime[token], periodFinish[token])) * rewardRate[token] * PRECISION / totalSupply);
     }
 
-    function _updateRewardPerToken(address token) internal returns (uint) {
+    function _batchUserRewards(address token, uint tokenId, uint maxRuns) internal view returns (uint, uint) {
+        uint _startTimestamp = lastEarn[token][tokenId];
+        if (numCheckpoints[tokenId] == 0) {
+            return (userRewards[token][tokenId], _startTimestamp);
+        }
+
+        uint _startIndex = getPriorBalanceIndex(tokenId, _startTimestamp);
+        uint _endIndex = Math.min(numCheckpoints[tokenId]-1, maxRuns);
+
+        uint reward = userRewards[token][tokenId];
+        for (uint i = _startIndex; i < _endIndex; i++) {
+            Checkpoint memory cp0 = checkpoints[tokenId][i];
+            Checkpoint memory cp1 = checkpoints[tokenId][i+1];
+            (uint _rewardPerTokenStored0,) = getPriorRewardPerToken(token, cp0.timestamp);
+            (uint _rewardPerTokenStored1,) = getPriorRewardPerToken(token, cp1.timestamp);
+            reward += cp0.balanceOf * (_rewardPerTokenStored1 - _rewardPerTokenStored0) / PRECISION;
+            _startTimestamp = cp1.timestamp;
+        }
+
+        return (reward, _startTimestamp);
+    }
+
+    function batchRewardPerToken(address token, uint maxRuns) external {
+        (rewardPerTokenStored[token], lastUpdateTime[token])  = _batchRewardPerToken(token, maxRuns);
+    }
+
+    function _batchRewardPerToken(address token, uint maxRuns) internal returns (uint, uint) {
         uint _startTimestamp = lastUpdateTime[token];
         uint reward = rewardPerTokenStored[token];
 
         if (supplyNumCheckpoints == 0) {
-            return reward;
+            return (reward, _startTimestamp);
+        }
+
+        uint _startIndex = getPriorSupplyIndex(_startTimestamp);
+        uint _endIndex = Math.min(supplyNumCheckpoints-1, maxRuns);
+
+        for (uint i = _startIndex; i < _endIndex; i++) {
+            SupplyCheckpoint memory sp0 = supplyCheckpoints[i];
+            if (sp0.supply > 0) {
+                SupplyCheckpoint memory sp1 = supplyCheckpoints[i+1];
+                (uint _reward, uint endTime) = _calcRewardPerToken(token, sp1.timestamp, sp0.timestamp, sp0.supply, _startTimestamp);
+                reward += _reward;
+                _writeRewardPerTokenCheckpoint(token, reward, endTime);
+                _startTimestamp = endTime;
+            }
+        }
+
+        return (reward, _startTimestamp);
+    }
+
+    function _calcRewardPerToken(address token, uint timestamp1, uint timestamp0, uint supply, uint startTimestamp) internal view returns (uint, uint) {
+        uint endTime = Math.max(timestamp1, startTimestamp);
+        return (((Math.min(endTime, periodFinish[token]) - Math.min(Math.max(timestamp0, startTimestamp), periodFinish[token])) * rewardRate[token] * PRECISION / supply), endTime);
+    }
+
+    function _updateRewardPerToken(address token) internal returns (uint, uint) {
+        uint _startTimestamp = lastUpdateTime[token];
+        uint reward = rewardPerTokenStored[token];
+
+        if (supplyNumCheckpoints == 0) {
+            return (reward, _startTimestamp);
         }
 
         uint _startIndex = getPriorSupplyIndex(_startTimestamp);
         uint _endIndex = supplyNumCheckpoints-1;
-        uint _rewardRate = rewardRate[token];
 
         if (_endIndex - _startIndex > 1) {
             for (uint i = _startIndex; i < _endIndex-1; i++) {
                 SupplyCheckpoint memory sp0 = supplyCheckpoints[i];
-                if (i == _startIndex) {
-                    sp0.timestamp = Math.max(sp0.timestamp, _startTimestamp);
+                if (sp0.supply > 0) {
+                  SupplyCheckpoint memory sp1 = supplyCheckpoints[i+1];
+                  (uint _reward, uint _endTime) = _calcRewardPerToken(token, sp1.timestamp, sp0.timestamp, sp0.supply, _startTimestamp);
+                  reward += _reward;
+                  _writeRewardPerTokenCheckpoint(token, reward, _endTime);
+                  _startTimestamp = _endTime;
                 }
-                SupplyCheckpoint memory sp1 = supplyCheckpoints[i+1];
-                if (_rewardRate > 0 && sp0.supply > 0) {
-                  reward += ((sp1.timestamp - sp0.timestamp) * _rewardRate * PRECISION / sp0.supply);
-                  _writeRewardPerTokenCheckpoint(token, reward, sp1.timestamp);
-                }
-
             }
         }
 
         SupplyCheckpoint memory sp = supplyCheckpoints[_endIndex];
-        if (_endIndex == _startIndex) {
-            sp.timestamp = Math.max(sp.timestamp, _startTimestamp);
-        }
-        if (_rewardRate > 0 && sp.supply > 0) {
-            reward += ((lastTimeRewardApplicable(token) - sp.timestamp) * _rewardRate * PRECISION / sp.supply);
-            _writeRewardPerTokenCheckpoint(token, reward, lastTimeRewardApplicable(token));
+        if (sp.supply > 0) {
+            (uint _reward,) = _calcRewardPerToken(token, lastTimeRewardApplicable(token), Math.max(sp.timestamp, _startTimestamp), sp.supply, _startTimestamp);
+            reward += _reward;
+            _writeRewardPerTokenCheckpoint(token, reward, block.timestamp);
+            _startTimestamp = block.timestamp;
         }
 
-        return reward;
+        return (reward, _startTimestamp);
     }
 
     function earned(address token, uint tokenId) public view returns (uint) {
         uint _startTimestamp = lastEarn[token][tokenId];
         if (numCheckpoints[tokenId] == 0) {
-            return 0;
+            return userRewards[token][tokenId];
         }
 
         uint _startIndex = getPriorBalanceIndex(tokenId, _startTimestamp);
         uint _endIndex = numCheckpoints[tokenId]-1;
 
-        uint reward = 0;
+        uint reward = userRewards[token][tokenId];
 
         if (_endIndex - _startIndex > 1) {
             for (uint i = _startIndex; i < _endIndex-1; i++) {
@@ -353,7 +417,7 @@ contract Bribe {
                 Checkpoint memory cp1 = checkpoints[tokenId][i+1];
                 (uint _rewardPerTokenStored0,) = getPriorRewardPerToken(token, cp0.timestamp);
                 (uint _rewardPerTokenStored1,) = getPriorRewardPerToken(token, cp1.timestamp);
-                reward += (cp0.balanceOf * _rewardPerTokenStored1 - _rewardPerTokenStored0) / PRECISION;
+                reward += cp0.balanceOf * (_rewardPerTokenStored1 - _rewardPerTokenStored0) / PRECISION;
             }
         }
 
@@ -386,9 +450,7 @@ contract Bribe {
     // used to notify a gauge/bribe of a given reward, this can create griefing attacks by extending rewards
     // TODO: rework to weekly resets, _updatePeriod as per v1 bribes
     function notifyRewardAmount(address token, uint amount) external lock {
-        rewardPerTokenStored[token] = _updateRewardPerToken(token);
-        lastUpdateTime[token] = block.timestamp;
-        _writeRewardPerTokenCheckpoint(token, rewardPerTokenStored[token], lastUpdateTime[token]);
+        (rewardPerTokenStored[token], lastUpdateTime[token]) = _updateRewardPerToken(token);
 
         if (block.timestamp >= periodFinish[token]) {
             _safeTransferFrom(token, msg.sender, address(this), amount);
@@ -400,6 +462,7 @@ contract Bribe {
             _safeTransferFrom(token, msg.sender, address(this), amount);
             rewardRate[token] = (amount + _left) / DURATION;
         }
+        require(rewardRate[token] > 0);
         periodFinish[token] = block.timestamp + DURATION;
         if (!isReward[token]) {
             isReward[token] = true;
@@ -421,7 +484,6 @@ contract Bribe {
 }
 
 contract BaseV1Voter {
-
     address public immutable _ve; // the ve token that governs these contracts
     address internal immutable factory; // the BaseV1Factory
     address internal immutable base;
@@ -433,7 +495,7 @@ contract BaseV1Voter {
     uint _unlocked = 1;
     modifier lock() {
         require(_unlocked == 1);
-        _unlocked = 0;
+        _unlocked = 2;
         _;
         _unlocked = 1;
     }
@@ -444,7 +506,7 @@ contract BaseV1Voter {
     mapping(address => address) public bribes; // gauge => bribe
     mapping(address => uint) public weights; // pool => weight
     mapping(uint => mapping(address => uint)) public votes; // nft => pool => votes
-    mapping(uint => address[]) public poolVote;// nft => pools
+    mapping(uint => address[]) public poolVote; // nft => pools
     mapping(uint => uint) public usedWeights;  // nft => total voting weight of user
 
     constructor(address __ve, address _factory, address  _gauges) {
@@ -535,6 +597,7 @@ contract BaseV1Voter {
         require(IBaseV1Factory(factory).isPair(_pool), "!_pool");
         address _bribe = address(new Bribe());
         address _gauge = IBaseV1GaugeFactory(gaugefactory).createGauge(_pool, _bribe, _ve);
+        erc20(base).approve(_gauge, type(uint).max);
         bribes[_gauge] = _bribe;
         gauges[_pool] = _gauge;
         poolForGauge[_gauge] = _pool;
@@ -551,8 +614,7 @@ contract BaseV1Voter {
     mapping(address => uint) internal supplyIndex;
     mapping(address => uint) public claimable;
 
-    // Accrue fees on token0
-    function notifyRewardAmount(uint amount) public lock {
+    function notifyRewardAmount(uint amount) external lock {
         _safeTransferFrom(base, msg.sender, address(this), amount); // transfer the distro in
         uint256 _ratio = amount * 1e18 / totalWeight; // 1e18 adjustment is removed during claim
         if (_ratio > 0) {
@@ -576,7 +638,7 @@ contract BaseV1Voter {
         updateFor(0, pools.length);
     }
 
-    function updateFor(address _gauge) external {
+    function updateGauge(address _gauge) external {
         _updateFor(_gauge);
     }
 
@@ -597,13 +659,21 @@ contract BaseV1Voter {
         }
     }
 
-    function claimRewards(address[] memory _gauges, address[][] memory _tokens, address account) external {
+    function claimRewards(address[] memory _gauges, address[][] memory _tokens) external {
         for (uint i = 0; i < _gauges.length; i ++) {
-            IGauge(_gauges[i]).getReward(account, _tokens[i]);
+            IGauge(_gauges[i]).getReward(msg.sender, _tokens[i]);
         }
     }
 
     function claimBribes(address[] memory _bribes, address[][] memory _tokens, uint _tokenId) external {
+        require(ve(_ve).isApprovedOrOwner(msg.sender, _tokenId));
+        for (uint i = 0; i < _bribes.length; i ++) {
+            Bribe(_bribes[i]).getRewardForOwner(_tokenId, _tokens[i]);
+        }
+    }
+
+    function claimFees(address[] memory _bribes, address[][] memory _tokens, uint _tokenId) external {
+        require(ve(_ve).isApprovedOrOwner(msg.sender, _tokenId));
         for (uint i = 0; i < _bribes.length; i ++) {
             Bribe(_bribes[i]).getRewardForOwner(_tokenId, _tokens[i]);
         }
@@ -615,14 +685,14 @@ contract BaseV1Voter {
         }
     }
 
-
     function distribute(address _gauge) public lock {
         _updateFor(_gauge);
         uint _claimable = claimable[_gauge];
-        claimable[_gauge] = 0;
-        erc20(base).approve(_gauge, 0); // first set to 0, this helps reset some non-standard tokens
-        erc20(base).approve(_gauge, _claimable);
-        IGauge(_gauge).notifyRewardAmount(base, _claimable);
+        uint _left = IGauge(_gauge).left(base);
+        if (_claimable > _left) {
+            claimable[_gauge] = 0;
+            IGauge(_gauge).notifyRewardAmount(base, _claimable);
+        }
     }
 
     function distro() external {
@@ -643,35 +713,6 @@ contract BaseV1Voter {
         for (uint x = 0; x < _gauges.length; x++) {
             distribute(_gauges[x]);
         }
-    }
-
-    function distributeEx(address token) external {
-        distributeEx(token, 0, pools.length);
-    }
-
-    // setup distro > then distribute
-
-    function distributeEx(address token, uint start, uint finish) public lock {
-        uint _balance = erc20(token).balanceOf(address(this));
-        if (_balance > 0 && totalWeight > 0) {
-            uint _totalWeight = totalWeight;
-            for (uint x = start; x < finish; x++) {
-              uint _reward = _balance * weights[pools[x]] / _totalWeight;
-              if (_reward > 0) {
-                  address _gauge = gauges[pools[x]];
-
-                  erc20(token).approve(_gauge, 0); // first set to 0, this helps reset some non-standard tokens
-                  erc20(token).approve(_gauge, _reward);
-                  IGauge(_gauge).notifyRewardAmount(token, _reward); // can return false, will simply not distribute tokens
-              }
-            }
-        }
-    }
-
-    function _safeTransfer(address token, address to, uint256 value) internal {
-        (bool success, bytes memory data) =
-            token.call(abi.encodeWithSelector(erc20.transfer.selector, to, value));
-        require(success && (data.length == 0 || abi.decode(data, (bool))));
     }
 
     function _safeTransferFrom(address token, address from, address to, uint256 value) internal {

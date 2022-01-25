@@ -13,15 +13,19 @@ library Math {
 interface ve {
     function token() external view returns (address);
     function totalSupply() external view returns (uint);
+    function create_lock_for(uint, uint, address) external returns (uint);
+    function transferFrom(address, address, uint) external;
 }
 
 interface underlying {
     function approve(address spender, uint value) external returns (bool);
     function mint(address, uint) external;
     function totalSupply() external view returns (uint);
+    function balanceOf(address) external view returns (uint);
+    function transfer(address, uint) external returns (bool);
 }
 
-interface gauge_proxy {
+interface voter {
     function notifyRewardAmount(uint amount) external;
 }
 
@@ -34,27 +38,45 @@ interface ve_dist {
 
 contract BaseV1Minter {
     uint constant week = 86400 * 7; // allows minting once per week (reset every Thursday 00:00 UTC)
-    uint constant emission = 2;
+    uint constant emission = 98;
+    uint constant tail_emission = 2;
     uint constant target_base = 100; // 2% per week target emission
     uint constant tail_base = 1000; // 0.2% per week target emission
     underlying public immutable _token;
-    gauge_proxy public immutable _gauge_proxy;
+    voter public immutable _voter;
     ve public immutable _ve;
     ve_dist public immutable _ve_dist;
-    uint public available;
+    uint public weekly = 20000000e18;
     uint public active_period;
+    uint constant lock = 86400 * 7 * 52 * 4;
+
+    address initializer;
 
     constructor(
-      //uint _available, // the minting target halfway point, assuming 500mm
-      address __gauge_proxy, // the voting & distribution system
-      address  __ve, // the ve(3,3) system that will be locked into
-      address __ve_dist // the distribution system that ensures users aren't diluted
+        address __voter, // the voting & distribution system
+        address  __ve, // the ve(3,3) system that will be locked into
+        address __ve_dist // the distribution system that ensures users aren't diluted
     ) {
+        initializer = msg.sender;
         _token = underlying(ve(__ve).token());
-        available = 1000000000e18;//_available;
-        _gauge_proxy = gauge_proxy(__gauge_proxy);
+        _voter = voter(__voter);
         _ve = ve(__ve);
         _ve_dist = ve_dist(__ve_dist);
+        active_period = (block.timestamp + week) / week * week;
+    }
+
+    function initialize(
+        address[] memory claimants,
+        uint[] memory amounts,
+        uint max // sum amounts / max = % ownership of top protocols, so if initial 20m is distributed, and target is 25% protocol ownership, then max - 4 x 20m = 80m
+    ) external {
+        require(initializer == msg.sender);
+        _token.mint(address(this), max);
+        _token.approve(address(_ve), type(uint).max);
+        for (uint i = 0; i < claimants.length; i++) {
+            _ve.create_lock_for(amounts[i], lock, claimants[i]);
+        }
+        initializer = address(0);
     }
 
     // calculate circulating supply as total token supply - locked supply
@@ -64,7 +86,7 @@ contract BaseV1Minter {
 
     // emission calculation is 2% of available supply to mint adjusted by circulating / total supply
     function calculate_emission() public view returns (uint) {
-        return available * emission / target_base * circulating_supply() / _token.totalSupply();
+        return weekly * emission / target_base * circulating_supply() / _token.totalSupply();
     }
 
     // weekly emission takes the max of calculated (aka target) emission versus circulating tail end emission
@@ -74,12 +96,12 @@ contract BaseV1Minter {
 
     // calculates tail end (infinity) emissions as 0.2% of total supply
     function circulating_emission() public view returns (uint) {
-        return circulating_supply() * emission / tail_base;
+        return circulating_supply() * tail_emission / tail_base;
     }
 
     // calculate inflation and adjust ve balances accordingly
     function calculate_growth(uint _minted) public view returns (uint) {
-        return _ve.totalSupply() * _minted / circulating_supply();
+        return _ve.totalSupply() * _minted / _token.totalSupply();
     }
 
     // update period can only be called once per cycle (1 week)
@@ -88,18 +110,21 @@ contract BaseV1Minter {
         if (block.timestamp >= _period + week) { // only trigger if new week
             _period = block.timestamp / week * week;
             active_period = _period;
-            uint _amount = weekly_emission();
-            if (_amount <= available) {
-                available -= _amount;
+            weekly = weekly_emission();
+
+            uint _growth = calculate_growth(weekly);
+            uint _required = _growth + weekly;
+            uint _balanceOf = _token.balanceOf(address(this));
+            if (_balanceOf < _required) {
+                _token.mint(address(this), _required-_balanceOf);
             }
 
-            _token.mint(address(_ve_dist), calculate_growth(_amount)); // mint inflation for staked users based on their % balance
+            _token.transfer(address(_ve_dist), _growth);
             _ve_dist.checkpoint_token(); // checkpoint token balance that was just minted in ve_dist
             _ve_dist.checkpoint_total_supply(); // checkpoint supply
 
-            _token.mint(address(this), _amount); // mint weekly emission to gauge proxy (handles voting and distribution)
-            _token.approve(address(_gauge_proxy), _amount);
-            _gauge_proxy.notifyRewardAmount(_amount);
+            _token.approve(address(_voter), weekly);
+            _voter.notifyRewardAmount(weekly);
         }
         return _period;
     }
