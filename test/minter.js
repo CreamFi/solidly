@@ -51,6 +51,7 @@ describe("minter", function () {
     const VeDist = await ethers.getContractFactory("contracts/ve_dist.sol:ve_dist");
     ve_dist = await VeDist.deploy(ve.address, ve_underlying.address, owner.address);
     await ve_dist.deployed();
+    await ve.setVoter(gauge_factory.address);
 
     const BaseV1Minter = await ethers.getContractFactory("BaseV1Minter");
     minter = await BaseV1Minter.deploy(gauge_factory.address, ve.address, ve_dist.address);
@@ -93,7 +94,7 @@ describe("minter", function () {
     await network.provider.send("evm_mine")
     await minter.update_period();
     const claimable = await ve_dist.claimable(1);
-    expect(claimable).to.be.above(ethers.BigNumber.from("230039145118808654"));
+    expect(claimable).to.be.above(ethers.BigNumber.from("220039145118808654"));
     const before = await ve.balanceOfNFT(1);
     await ve_dist.claim(1);
     const after = await ve.balanceOfNFT(1);
